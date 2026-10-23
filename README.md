@@ -192,7 +192,6 @@ git push origin v1.2.0 && git push -f origin v1
 
 A breaking change to inputs, script names or the tag format gets `v2`.
 
-While this repository is private, other private repositories of the
-organisation can only use it because its Actions access is set to
-**"Accessible from repositories in the 'schaefersoft' organization"**
-(Settings → Actions → General → Access).
+## License
+
+MIT — see [LICENSE](LICENSE).

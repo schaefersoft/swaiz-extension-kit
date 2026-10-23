@@ -182,7 +182,7 @@ build_one() {
   for oversized in "$outdir"/*; do
     if [ -f "$oversized" ] && [ "$(stat -c%s "$oversized")" -gt "$asset_limit" ]; then
       echo "! $(basename "$oversized") ($(du -h "$oversized" | cut -f1)) überschreitet GitHubs 2-GiB-Asset-Limit" >&2
-      echo "  Release von ${name} abgebrochen (kein Tag gesetzt). Grosse Images brauchen den Direkt-Upload zum Distribution-Server." >&2
+      echo "  Release von ${name} abgebrochen (kein Tag gesetzt). Das Image muss kleiner werden, einen anderen Weg zum Distribution-Server gibt es nicht." >&2
       return 1
     fi
   done

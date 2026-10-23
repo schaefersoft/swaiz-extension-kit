@@ -20,6 +20,11 @@ swaiz-extension-kit/
     └── extension-release.yaml         reusable: plan → build → publish
 ```
 
+The complete workflow for extension developers, from a new repository to a
+release customers can install, is in the developer handbook:
+[Aufbau und Release](https://swaiz.ch/docs/entwickler/structure-and-release) and
+[Lokal entwickeln](https://swaiz.ch/docs/entwickler/local-development).
+
 New extensions start from
 [`swaiz-extension-template`](https://github.com/schaefersoft/swaiz-extension-template),
 which already wires everything below.
@@ -195,13 +200,12 @@ aictl extension lint .                   # manifest validation, offline
 bash check.sh                            # the extension's own checks
 swaiz-ext-build-images .                 # own service images → images/
 swaiz-ext-build .                        # → dist/dl/extensions/<name>/<version>/
-(cd dist && python3 -m http.server 8080) # serve the /dl tree like the real server
 ```
 
-In a dev build of aictl, set `license.serverURL: http://localhost:8080`, then
-`aictl extension install <name>`. A locally built bundle is **unsigned**, so a
-release `aictl` refuses it. Dev builds of aictl are internal; without one, test
-the real, server-signed release on a test node instead.
+A locally built bundle is **unsigned**, and every `aictl` refuses it, dev builds
+included. The real install flow is tested with a server-signed pre-release on a
+test installation, see
+[Lokal entwickeln](https://swaiz.ch/docs/entwickler/local-development#testrelease-auf-einer-testinstallation).
 
 ## Troubleshooting
 

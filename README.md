@@ -21,7 +21,8 @@ swaiz-extension-kit/
 ```
 
 The complete workflow for extension developers, from a new repository to a
-release customers can install, is in the developer handbook:
+release customers can install, is in the developer handbook (needs an account
+in the customer portal):
 [Aufbau und Release](https://swaiz.ch/docs/entwickler/structure-and-release) and
 [Lokal entwickeln](https://swaiz.ch/docs/entwickler/local-development).
 
@@ -35,10 +36,9 @@ which already wires everything below.
 |---|---|
 | Linux, or Windows with WSL 2 | every script — they use GNU `stat`, `tar` and `sha256sum`; macOS's BSD tools don't fit |
 | bash 4+, git, GNU coreutils, tar, gzip | every script |
-| Docker 23 or newer (BuildKit) | `swaiz-ext-build-images` (named build contexts) and most `check.sh` |
+| Docker 23 or newer with the `buildx` plugin | `swaiz-ext-build-images` (named build contexts) and most `check.sh` |
 | `aictl` — `curl -fsSL https://swaiz.ch/install \| sh` | `aictl extension lint` |
 | `gh`, logged in | `swaiz-ext-release publish` — CI does this for you |
-| python3 | serving `dist/` locally |
 
 **On Windows, work inside WSL:**
 
@@ -192,7 +192,7 @@ CI only needs the repository's own `GITHUB_TOKEN`.
 ## Build & test locally
 
 ```sh
-git clone git@github.com:schaefersoft/swaiz-extension-kit.git ~/swaiz-extension-kit
+git clone https://github.com/schaefersoft/swaiz-extension-kit.git ~/swaiz-extension-kit
 export PATH="$HOME/swaiz-extension-kit/bin:$PATH"
 
 cd my-extension
@@ -244,6 +244,7 @@ git switch release && git pull
 git tag v1.2.0 && git tag -f v1 v1.2.0
 git push origin v1.2.0 && git push -f origin v1
 gh release create v1.2.0 --verify-tag --title v1.2.0 --notes "…"
+git switch dev && git merge --ff-only release && git push
 ```
 
 Version tags (`vX.Y.Z`) are protected and can be neither moved nor deleted;

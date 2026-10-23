@@ -24,6 +24,28 @@ New extensions start from
 [`swaiz-extension-template`](https://github.com/schaefersoft/swaiz-extension-template),
 which already wires everything below.
 
+## Prerequisites
+
+| Tool | Needed for |
+|---|---|
+| Linux, or Windows with WSL 2 | every script — they use GNU `stat`, `tar` and `sha256sum`; macOS's BSD tools don't fit |
+| bash 4+, git, GNU coreutils, tar, gzip | every script |
+| Docker 23 or newer (BuildKit) | `swaiz-ext-build-images` (named build contexts) and most `check.sh` |
+| `aictl` — `curl -fsSL https://swaiz.ch/install \| sh` | `aictl extension lint` |
+| `gh`, logged in | `swaiz-ext-release publish` — CI does this for you |
+| python3 | serving `dist/` locally |
+
+**On Windows, work inside WSL:**
+
+- Clone into the WSL file system (`~/…`), not under `/mnt/c`.
+- The repositories enforce LF line endings (`.gitattributes`), but an editor
+  writing through `\\wsl$\…` can still save CRLF. A script then fails with
+  `$'\r': command not found` or a syntax error in the middle of the file. Fix it
+  with `sed -i 's/\r$//' <file>`.
+- Commit from inside WSL. Git for Windows on a WSL path drops the executable
+  bit (`mode change 100755 => 100644`), and the scripts then fail with
+  `Permission denied`.
+
 ## Repository layouts
 
 The kit supports both, detected from where `extension.yaml` lives:
@@ -176,21 +198,53 @@ swaiz-ext-build .                        # → dist/dl/extensions/<name>/<versio
 (cd dist && python3 -m http.server 8080) # serve the /dl tree like the real server
 ```
 
-In a dev aictl install, set `license.serverURL: http://localhost:8080`, then
+In a dev build of aictl, set `license.serverURL: http://localhost:8080`, then
 `aictl extension install <name>`. A locally built bundle is **unsigned**, so a
-release `aictl` refuses it — local testing needs a `-tags dev` build.
+release `aictl` refuses it. Dev builds of aictl are internal; without one, test
+the real, server-signed release on a test node instead.
 
-## Releasing the kit
+## Troubleshooting
 
-Callers pin the major tag `v1`. A release of the kit is an immutable
-`vX.Y.Z` tag plus moving the major tag:
+| Message or symptom | Meaning | What to do |
+|---|---|---|
+| `! <branch> moved under <ext>/ while <name>@<version> was building` | Someone pushed to the extension while the release was building. Nothing was tagged. | Nothing. The run that push started releases the newer state. |
+| `= <name>/v<version> already exists — skipping publish` | A re-run of a release that already went out. | Nothing. |
+| `! <name>/v<version> already exists — version conflict, check the manifest` | First release, but the `version:` in the manifest is already tagged. | Raise `version:` in the manifest. |
+| `version '…' is not semver` | `version:` is not `MAJOR.MINOR.PATCH[-pre]`. | Fix the manifest. |
+| `manifest name '…' != directory '…'` | Several extensions per repository: directory and `name:` differ. | Rename one of them. |
+| `… überschreitet GitHubs 2-GiB-Asset-Limit` | A sibling image is over GitHub's 2 GiB limit for release assets. Nothing was tagged. | Slim the image: drop build tools, and download model weights on first start into a volume instead of baking them in. |
+| `<name>-<version>.tar.gz is … MiB packed and … MiB unpacked` | The bundle exceeds what aictl downloads (200 MiB) or unpacks (2 GiB). | Move large files out of the bundle. Images over 50 MB already ship as siblings. |
+| `referenced file(s) missing` from `aictl extension lint` | A hook, n8n workflow, migration or seed named in the manifest is not in the repository. | Add the file or fix the path. |
+| `check.sh` fails in the release job | The release refuses to ship an unhealthy extension. Nothing was tagged. | Fix it on `dev` and merge again. |
+| The bump push is rejected: `GH013` / `Changes must be made through a pull request` | A ruleset on `release` requires pull requests, but the release workflow pushes its version bump directly. | Protect `release` against deletion and force pushes only. |
+| `unknown flag: --build-context` | Docker is too old for named build contexts. | Docker 23 or newer. |
+| Tag exists, but the GitHub Release lacks assets | The upload failed after the tag was pushed. A re-run plans nothing, because the tag already marks the version as released. | Rebuild that version at its tag and upload by hand: `git switch --detach <name>/v<version>`, `swaiz-ext-release build <ext> <version>`, `gh release upload <name>/v<version> dist/dl/extensions/<name>/<version>/* --clobber`. |
+
+## Changing the kit
+
+1. Branch off `dev`, make the change, run `tests/smoke.sh` and
+   `shellcheck bin/* tests/*.sh`.
+2. Try the scripts against a real extension: in its repository, put your
+   checkout first on the `PATH` (`export PATH="<kit>/bin:$PATH"`) and run
+   `swaiz-ext-release plan` and `swaiz-ext-build .`.
+3. For workflow changes: the reusable workflows load the scripts through
+   `schaefersoft/swaiz-extension-kit@v1`. To try a branch from a test
+   repository, call the workflow there with `@<branch>` and, on the branch,
+   point the inner `uses: schaefersoft/swaiz-extension-kit@v1` lines at the
+   branch as well. Set them back to `@v1` before merging.
+4. Open a pull request into `release`; CI must be green.
+5. Tag the release and move the major tag. Callers pin `v1`:
 
 ```sh
+git switch release && git pull
 git tag v1.2.0 && git tag -f v1 v1.2.0
 git push origin v1.2.0 && git push -f origin v1
+gh release create v1.2.0 --verify-tag --title v1.2.0 --notes "…"
 ```
 
-A breaking change to inputs, script names or the tag format gets `v2`.
+Version tags (`vX.Y.Z`) are protected and can be neither moved nor deleted;
+only `v1` moves. A breaking change to inputs, script names or the tag format
+gets `v2`.
 
 ## License
 

@@ -28,7 +28,7 @@ read_field() { sed -n "s/^$1:[[:space:]]*//p" "$2" | head -1 \
 
 name="$(read_field name "$manifest")"
 version="$(read_field version "$manifest")"
-[ -n "$name" ] && [ -n "$version" ] || { echo "could not read name/version from $manifest" >&2; exit 1; }
+if [ -z "$name" ] || [ -z "$version" ]; then echo "could not read name/version from $manifest" >&2; exit 1; fi
 
 # The directory name is the extension name — they must match (it is the download
 # path, the on-disk layout and the spec key).
@@ -58,7 +58,7 @@ mkdir -p "$outdir"
 # install; a multi-GB model server (e.g. baked ASR weights) rides sibling.
 members=(extension.yaml)
 for d in migrations seeds n8n hooks images; do [ -d "$dir/$d" ] && members+=("$d"); done
-[ -d "$dir/hooks" ] && chmod +x "$dir"/hooks/*.sh 2>/dev/null || true
+if [ -d "$dir/hooks" ]; then chmod +x "$dir"/hooks/*.sh 2>/dev/null || true; fi
 
 inline_image_max=$((50 * 1024 * 1024))
 tar_excludes=()

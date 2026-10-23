@@ -28,7 +28,7 @@ read_field() { sed -n "s/^$1:[[:space:]]*//p" "$2" | head -1 \
 
 name="$(read_field name "$manifest")"
 version="$(read_field version "$manifest")"
-[ -n "$name" ] && [ -n "$version" ] || { echo "could not read name/version from $manifest" >&2; exit 1; }
+if [ -z "$name" ] || [ -z "$version" ]; then echo "could not read name/version from $manifest" >&2; exit 1; fi
 
 # Staging dir inside the extension; swaiz-ext-build adds it as a bundle member so the
 # image ships inside the download zip. Rebuilt fresh each run.

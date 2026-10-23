@@ -1,0 +1,75 @@
+#!/usr/bin/env bash
+# Build + save this repo's OWN service image(s) of ONE extension into an images/
+# staging dir, which swaiz-ext-build then folds INTO the metadata bundle (the download
+# zip). No container registry, no sibling asset: the image rides inside the bundle
+# and is covered by the bundle's own (server-signed) checksum. Third-party images
+# (referenced from a public registry, no Dockerfile here) are NOT saved — they are
+# pulled at install time.
+#
+# Run BEFORE swaiz-ext-build. A no-op for extensions without a services/ dir.
+#
+# Usage: swaiz-ext-build-images [<extension-dir>]     e.g. swaiz-ext-build-images . | swaiz-ext-build-images archive
+set -euo pipefail
+
+kit="$(cd "$(dirname "$0")/.." && pwd)"
+ext="${1:-.}"; ext="${ext%/}"
+[ -d "$ext" ] || { echo "no such directory: $ext" >&2; exit 2; }
+dir="$(cd "$ext" && pwd)"
+manifest="$dir/extension.yaml"
+[ -f "$manifest" ] || { echo "no extension.yaml in $ext/" >&2; exit 1; }
+
+if [ ! -d "$dir/services" ]; then
+  echo "no services/ in $ext/ — no images to build"
+  exit 0
+fi
+
+read_field() { sed -n "s/^$1:[[:space:]]*//p" "$2" | head -1 \
+  | sed -e 's/[[:space:]]*#.*$//' -e 's/^"\(.*\)"$/\1/' -e "s/^'\(.*\)'\$/\1/" -e 's/[[:space:]]*$//'; }
+
+name="$(read_field name "$manifest")"
+version="$(read_field version "$manifest")"
+[ -n "$name" ] && [ -n "$version" ] || { echo "could not read name/version from $manifest" >&2; exit 1; }
+
+# Staging dir inside the extension; swaiz-ext-build adds it as a bundle member so the
+# image ships inside the download zip. Rebuilt fresh each run.
+imgdir="$dir/images"
+rm -rf "$imgdir"; mkdir -p "$imgdir"
+
+built=0
+for svcdir in "$dir"/services/*/; do
+  [ -f "$svcdir/Dockerfile" ] || continue
+  svc="$(basename "$svcdir")"
+  # Tag is what `docker load` recreates on the node; the manifest's image: must
+  # match it (e.g. product-search-api:0.1.0).
+  tag="${name}-${svc}:${version}"
+  tarball="${name}-${svc}-${version}.image.tar.gz"
+
+  echo "+ building $tag"
+  # A gated HuggingFace download (e.g. pyannote weights baked in at build time)
+  # takes the token as a BuildKit SECRET — never a build-arg/env, so it cannot
+  # end up in an image layer. Dockerfiles opt in via
+  # `RUN --mount=type=secret,id=hf_token …`; without HF_TOKEN in the caller's
+  # env nothing is passed and ungated builds are unaffected.
+  secret_args=()
+  [ -n "${HF_TOKEN:-}" ] && secret_args+=(--secret "id=hf_token,env=HF_TOKEN")
+  # The extension version is NOT baked in: aictl injects AICTL_EXTENSION_VERSION
+  # into every service at install time, so the same image reports whatever
+  # version it was shipped as.
+  # Single-arch amd64: on-prem services nodes are amd64; a tarball is one arch.
+  docker build --platform linux/amd64 "${secret_args[@]}" --build-context notices="$kit/notices" -t "$tag" "$svcdir"
+  docker save "$tag" | gzip > "$imgdir/$tarball"
+  echo "  saved $imgdir/$tarball ($(du -h "$imgdir/$tarball" | cut -f1))"
+  # In CI den Platz sofort zurückgeben: das Image steckt jetzt im Tarball, und
+  # der nächste grosse Build/Save braucht den Headroom (ein Modell-Server-Image
+  # belegt sonst Cache + Image + Export-Tmp gleichzeitig). Lokal bleibt das
+  # Image erhalten (Demo-Stacks nutzen es direkt).
+  if [ -n "${CI:-}" ]; then
+    docker rmi "$tag" >/dev/null 2>&1 || true
+    docker builder prune -af >/dev/null 2>&1 || true
+  fi
+  built=$((built + 1))
+done
+
+# All services are third-party registry refs (no Dockerfile) → no images/ dir.
+[ "$built" -gt 0 ] || rm -rf "$imgdir"
+echo "built ${built} own image(s) for ${name}@${version} (swaiz-ext-build ships each in-bundle or as a signed sibling, by size)"

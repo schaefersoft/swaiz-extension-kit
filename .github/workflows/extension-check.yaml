@@ -1,0 +1,71 @@
+name: extension-check
+
+on:
+  workflow_call:
+    inputs:
+      runner:
+        description: Runner label; empty uses the RUNNER variable, then ubuntu-latest.
+        type: string
+        default: ""
+
+jobs:
+  changes:
+    runs-on: ${{ inputs.runner || vars.RUNNER || 'ubuntu-latest' }}
+    outputs:
+      matrix: ${{ steps.detect.outputs.matrix }}
+      any: ${{ steps.detect.outputs.any }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Detect changed extensions
+        id: detect
+        env:
+          BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: |
+          if [ -f extension.yaml ]; then
+            out='{"ext":"."}'
+          else
+            if [ -z "$BASE" ] || ! git cat-file -e "$BASE" 2>/dev/null; then
+              changed=$(ls -d */ | sed 's#/##')
+            else
+              changed=$(git diff --name-only "$BASE"..HEAD | cut -d/ -f1 | sort -u)
+            fi
+            out="" sep=""
+            for ext in $changed; do
+              [ -f "$ext/extension.yaml" ] || continue
+              out="${out}${sep}{\"ext\":\"${ext}\"}"
+              sep=","
+            done
+          fi
+          echo "matrix=[$out]" >> "$GITHUB_OUTPUT"
+          if [ -z "$out" ]; then echo "any=false" >> "$GITHUB_OUTPUT"; else echo "any=true" >> "$GITHUB_OUTPUT"; fi
+          echo "checks: [$out]"
+
+  check:
+    needs: changes
+    if: needs.changes.outputs.any == 'true'
+    runs-on: ${{ inputs.runner || vars.RUNNER || 'ubuntu-latest' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJson(needs.changes.outputs.matrix) }}
+    name: check ${{ matrix.ext != '.' && matrix.ext || '' }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: schaefersoft/swaiz-extension-kit@v1
+        with:
+          install-aictl: "true"
+
+      - name: Lint manifest
+        run: aictl extension lint "${{ matrix.ext }}"
+
+      - name: Run extension checks
+        run: |
+          if [ -f "${{ matrix.ext }}/check.sh" ]; then
+            bash "${{ matrix.ext }}/check.sh"
+          else
+            echo "note: ${{ matrix.ext }} has no check.sh — manifest lint only"
+          fi

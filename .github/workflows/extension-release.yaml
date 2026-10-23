@@ -1,0 +1,91 @@
+name: extension-release
+
+on:
+  workflow_call:
+    inputs:
+      extension:
+        description: Limit to one extension directory (several extensions per repository only).
+        type: string
+        default: ""
+      runner:
+        description: Runner label; empty uses the RUNNER variable, then ubuntu-latest.
+        type: string
+        default: ""
+
+jobs:
+  plan:
+    runs-on: ${{ inputs.runner || vars.RUNNER || 'ubuntu-latest' }}
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+      any: ${{ steps.plan.outputs.any }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.ref_name }}
+          fetch-depth: 0
+
+      - uses: schaefersoft/swaiz-extension-kit@v1
+
+      - name: Plan changed extensions
+        id: plan
+        env:
+          ONLY: ${{ inputs.extension }}
+        run: |
+          matrix=$(swaiz-ext-release plan)
+          echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
+          if [ "$matrix" = "[]" ]; then echo "any=false" >> "$GITHUB_OUTPUT"; else echo "any=true" >> "$GITHUB_OUTPUT"; fi
+          echo "plan: $matrix"
+
+  release:
+    needs: plan
+    if: needs.plan.outputs.any == 'true'
+    runs-on: ${{ inputs.runner || vars.RUNNER || 'ubuntu-latest' }}
+    permissions:
+      contents: write
+    strategy:
+      max-parallel: 1
+      fail-fast: false
+      matrix:
+        include: ${{ fromJson(needs.plan.outputs.matrix) }}
+    name: release ${{ matrix.name }} v${{ matrix.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.ref_name }}
+          fetch-depth: 0
+
+      - name: Free runner disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/hostedtoolcache/CodeQL /opt/ghc /usr/local/.ghcup
+          sudo docker system prune -af >/dev/null 2>&1 || true
+          df -h /
+
+      - name: Configure git identity
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - uses: schaefersoft/swaiz-extension-kit@v1
+        with:
+          install-aictl: "true"
+
+      - name: Lint manifest
+        run: aictl extension lint "${{ matrix.ext }}"
+
+      - name: Run extension checks
+        run: |
+          if [ -f "${{ matrix.ext }}/check.sh" ]; then
+            bash "${{ matrix.ext }}/check.sh"
+          else
+            echo "note: ${{ matrix.ext }} has no check.sh — building unchecked"
+          fi
+
+      - name: Build bundle and images
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: swaiz-ext-release build "${{ matrix.ext }}" "${{ matrix.version }}"
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: swaiz-ext-release publish "${{ matrix.ext }}" "${{ matrix.version }}"

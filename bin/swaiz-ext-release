@@ -1,0 +1,281 @@
+#!/usr/bin/env bash
+# CI release driver — manifest-driven, AUTO-VERSIONED. Run from the repository
+# root. The extension is either the repository root (extension.yaml at the top)
+# or every top-level <ext>/ directory that holds one.
+#
+# Versioning is derived, not hand-edited. For each extension directory:
+#   1. Find the highest existing release tag "<name>/vX.Y.Z" (the last release).
+#   2. If anything under <ext>/ changed since that tag, the extension has
+#      unreleased work. The bump type comes from the Conventional Commit subjects
+#      of the commits that touched <ext>/ (and ONLY those), highest wins:
+#        "type!:" subject / "BREAKING CHANGE:" footer  -> major
+#        feat:                                         -> minor
+#        anything else (fix, perf, docs, …)            -> patch
+#   3. Build the bundle + service images, then commit the manifest bump, tag and
+#      publish a GitHub Release ("[skip ci]" so the push does not re-trigger CI).
+#
+# First release (no tag yet): ships the version currently in extension.yaml as-is.
+# Re-runs are safe: unchanged extensions are skipped, existing tags are skipped.
+#
+# PHASES (for the parallel workflow; no arguments = serial all-in-one for local
+# use). Only `publish` writes to git — `plan` and `build` are side-effect-free
+# on the repo, so build can fan out in a CI matrix without push races, and a
+# failed build never leaves a tag behind:
+#   swaiz-ext-release plan                    -> JSON matrix of changed extensions
+#   swaiz-ext-release build <ext> <version>   -> build bundle+images into dist/ (guarded)
+#   swaiz-ext-release publish <ext> <version> -> commit bump, tag, push, GitHub Release
+#
+# Env: GH_TOKEN (for `gh`), ONLY (optional: limit to one extension dir).
+set -euo pipefail
+
+kit="$(cd "$(dirname "$0")/.." && pwd)"
+
+ext_paths() {
+  if [ "$1" = "." ]; then
+    paths=(. ':(exclude).github')
+  else
+    paths=("$1/")
+  fi
+}
+
+read_field() { sed -n "s/^$1:[[:space:]]*//p" "$2" | head -1 \
+  | sed -e 's/[[:space:]]*#.*$//' -e 's/^"\(.*\)"$/\1/' -e "s/^'\(.*\)'\$/\1/" -e 's/[[:space:]]*$//'; }
+
+# max_released_version <name> — highest released version across the extension's
+# "<name>/vX.Y.Z" tags (semver order), or empty if it has never been released.
+max_released_version() {
+  local name="$1"
+  git tag --list "${name}/v*" | sed "s#^${name}/v##" | sort -V | tail -1
+}
+
+# classify_bump <range> <path> — echo major|minor|patch from the Conventional
+# Commit messages in <range> that touched <path>. Highest precedence wins;
+# defaults to patch when there are changes but no feat/breaking signal.
+classify_bump() {
+  local range="$1" path="$2" bump=patch subject paths
+  ext_paths "$path"
+  while IFS= read -r -d '' msg; do
+    subject="${msg%%$'\n'*}"
+    if printf '%s' "$msg" | grep -qE '(^|[[:cntrl:]])BREAKING[ -]CHANGE:' \
+       || printf '%s' "$subject" | grep -qE '^[a-z]+(\([^)]*\))?!:'; then
+      echo major
+      return
+    fi
+    if printf '%s' "$subject" | grep -qE '^feat(\([^)]*\))?:'; then
+      bump=minor
+    fi
+  done < <(git log -z --format='%B' "$range" -- "${paths[@]}")
+  echo "$bump"
+}
+
+# bump_version <version> <major|minor|patch> — echo the bumped semver core.
+bump_version() {
+  local core="${1%%-*}" type="$2" MA MI PA
+  IFS=. read -r MA MI PA <<<"$core"
+  case "$type" in
+    major) MA=$((MA + 1)); MI=0; PA=0 ;;
+    minor) MI=$((MI + 1)); PA=0 ;;
+    patch) PA=$((PA + 1)) ;;
+  esac
+  echo "${MA}.${MI}.${PA}"
+}
+
+# set_manifest_version <file> <version> — rewrite the top-level `version:` value,
+# preserving surrounding spacing and any trailing comment. Portable (no sed -i).
+set_manifest_version() {
+  local file="$1" v="$2" tmp
+  tmp="$(mktemp)"
+  sed -E "s#^(version:[[:space:]]*)[^[:space:]#]+#\1${v}#" "$file" >"$tmp" && mv "$tmp" "$file"
+}
+
+# set_manifest_image_versions <file> <name> <version> — retag every service
+# image built by this repo ("<name>-<svc>:<ver>") to <version>, leaving any
+# third-party image references untouched. Only concrete version tags (starting
+# with a digit) are rewritten: a v2 manifest writes "<name>-<svc>:${version}",
+# which aictl interpolates from the manifest version itself and which must
+# therefore survive the bump verbatim.
+set_manifest_image_versions() {
+  local file="$1" name="$2" v="$3" tmp
+  tmp="$(mktemp)"
+  sed -E "s#^([[:space:]]*image:[[:space:]]*${name}-[A-Za-z0-9._-]+):[0-9][^[:space:]#]*#\1:${v}#" "$file" >"$tmp" && mv "$tmp" "$file"
+}
+
+# plan_one <ext> — echo "<ext> <name> <version>" when the extension has
+# unreleased changes, nothing when it is up to date. Read-only.
+plan_one() {
+  local ext="$1" manifest="$1/extension.yaml" name last version bump paths
+  ext_paths "$ext"
+  name="$(read_field name "$manifest")"
+  [ "$ext" = "." ] || [ "$name" = "$ext" ] || { echo "! manifest name '$name' != directory '$ext'" >&2; return 1; }
+  last="$(max_released_version "$name")"
+
+  if [ -z "$last" ]; then
+    version="$(read_field version "$manifest")"
+    echo "+ first release of ${name}@${version}" >&2
+  else
+    if git diff --quiet "${name}/v${last}" HEAD -- "${paths[@]}"; then
+      echo "= ${name}@${last} unchanged since last release — skipping" >&2
+      return 0
+    fi
+    bump="$(classify_bump "${name}/v${last}..HEAD" "$ext")"
+    version="$(bump_version "$last" "$bump")"
+    echo "+ ${name}: ${last} -> ${version} (${bump})" >&2
+  fi
+
+  echo "$version" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$' \
+    || { echo "! version '$version' is not semver" >&2; return 1; }
+  if git rev-parse -q --verify "refs/tags/${name}/v${version}" >/dev/null; then
+    echo "! ${name}/v${version} already exists — version conflict, check the manifest" >&2
+    return 1
+  fi
+
+  printf '%s %s %s\n' "$ext" "$name" "$version"
+}
+
+# each_extension — echo the extension dirs plan/serial mode should consider.
+each_extension() {
+  local manifest ext
+  if [ -f extension.yaml ]; then
+    echo .
+    return
+  fi
+  shopt -s nullglob
+  for manifest in */extension.yaml; do
+    ext="$(dirname "$manifest")"
+    case "$ext" in .*) continue ;; esac
+    [ -n "${ONLY:-}" ] && [ "$ONLY" != "$ext" ] && continue
+    echo "$ext"
+  done
+}
+
+# cmd_plan — JSON matrix of changed extensions, for the CI fan-out.
+cmd_plan() {
+  local ext line out="" sep=""
+  while IFS= read -r ext; do
+    line="$(plan_one "$ext")" || exit 1
+    [ -n "$line" ] || continue
+    read -r _ name version <<<"$line"
+    out="${out}${sep}{\"ext\":\"${ext}\",\"name\":\"${name}\",\"version\":\"${version}\"}"
+    sep=","
+  done < <(each_extension)
+  printf '[%s]\n' "$out"
+}
+
+# build_one <ext> <version> — bundle + images into dist/, NO git writes. The
+# manifest is version-bumped locally so the bundle carries the right version;
+# publish_one re-applies the same bump on its own checkout.
+build_one() {
+  local ext="$1" version="$2" manifest="$1/extension.yaml" name outdir archive
+  name="$(read_field name "$manifest")"
+  set_manifest_version "$manifest" "$version"
+  set_manifest_image_versions "$manifest" "$name" "$version"
+
+  "$kit/bin/swaiz-ext-build-images" "$ext"
+  "$kit/bin/swaiz-ext-build" "$ext"
+  outdir="dist/dl/extensions/${name}/${version}"
+  archive="${name}-${version}.tar.gz"
+  [ -f "$outdir/$archive" ] || { echo "! build produced no $archive" >&2; return 1; }
+
+  # Pre-flight BEFORE anything is tagged: GitHub rejects release assets over
+  # 2 GiB. Failing here keeps the repo untouched (no tag, no half release).
+  local asset_limit=$((2 * 1024 * 1024 * 1024)) oversized
+  for oversized in "$outdir"/*; do
+    if [ -f "$oversized" ] && [ "$(stat -c%s "$oversized")" -gt "$asset_limit" ]; then
+      echo "! $(basename "$oversized") ($(du -h "$oversized" | cut -f1)) überschreitet GitHubs 2-GiB-Asset-Limit" >&2
+      echo "  Release von ${name} abgebrochen (kein Tag gesetzt). Grosse Images brauchen den Direkt-Upload zum Distribution-Server." >&2
+      return 1
+    fi
+  done
+}
+
+# publish_one <ext> <version> — the ONLY phase that writes to git. Expects the
+# build artifacts in dist/ (same job in serial mode, downloaded artifacts in CI).
+publish_one() {
+  local ext="$1" version="$2" manifest="$1/extension.yaml" name tag outdir archive notes
+  name="$(read_field name "$manifest")"
+  tag="${name}/v${version}"
+  outdir="dist/dl/extensions/${name}/${version}"
+  archive="${name}-${version}.tar.gz"
+
+  if git rev-parse -q --verify "refs/tags/${tag}" >/dev/null; then
+    echo "= ${tag} already exists — skipping publish (idempotent re-run)"
+    return 0
+  fi
+  [ -f "$outdir/$archive" ] || { echo "! missing build artifact $outdir/$archive" >&2; return 1; }
+
+  # The branch may have moved while we built (a push landing mid-run, or the
+  # release before this one in the matrix). Sync FIRST and write the bump on
+  # top of what is there: a bump commit REBASED onto a branch that already
+  # carries another one collides in exactly the lines this script rewrites.
+  # Tag AFTER the sync and push --atomic so branch and tag land together or
+  # not at all (a stray tag would poison the next plan).
+  local branch built paths
+  branch="$(git rev-parse --abbrev-ref HEAD)"
+  built="$(git rev-parse HEAD)"
+  git fetch --tags origin "$branch"
+
+  if git rev-parse -q --verify "refs/tags/${tag}" >/dev/null; then
+    echo "= ${tag} appeared while we were building — skipping publish"
+    return 0
+  fi
+  ext_paths "$ext"
+  if ! git diff --quiet "$built" FETCH_HEAD -- "${paths[@]}"; then
+    echo "! ${branch} moved under ${ext}/ while ${name}@${version} was building" >&2
+    echo "  (built $(git rev-parse --short "$built"), branch now $(git rev-parse --short FETCH_HEAD))" >&2
+    echo "  nothing tagged — the run that push queued will plan and build the newer state" >&2
+    return 1
+  fi
+  git reset --hard FETCH_HEAD
+
+  set_manifest_version "$manifest" "$version"
+  set_manifest_image_versions "$manifest" "$name" "$version"
+
+  if ! git diff --quiet -- "$manifest"; then
+    git add "$manifest"
+    git commit -m "chore(release): ${name} ${version} [skip ci]"
+  fi
+  git tag "$tag"
+  git push --atomic origin HEAD "refs/tags/${tag}"
+
+  notes="Automated release of ${name} ${version}."
+  [ -f "$ext/CHANGELOG.md" ] && notes="$(cat "$ext/CHANGELOG.md")"
+  local assets=("$outdir/$archive" "$outdir/checksums.txt")
+  local sibling
+  for sibling in "$outdir"/*.image.tar.gz; do
+    [ -e "$sibling" ] && assets+=("$sibling")
+  done
+  # Create and upload separately: an interrupted upload leaves a ghost asset
+  # on the release, and re-uploading that name gets 422 "already exists".
+  # --clobber replaces ghosts and stale assets, so re-publishing the same
+  # version converges on a complete release instead of failing forever.
+  if ! gh release view "$tag" >/dev/null 2>&1; then
+    gh release create "$tag" --title "${name} v${version}" --notes "$notes"
+  fi
+  gh release upload "$tag" "${assets[@]}" --clobber
+}
+
+# Serial all-in-one (local use / single-job fallback): plan → build → publish
+# per extension, aborting the whole run on the first failure.
+main() {
+  local released=0 ext line
+  while IFS= read -r ext; do
+    line="$(plan_one "$ext")" || exit 1
+    [ -n "$line" ] || continue
+    read -r _ _ version <<<"$line"
+    build_one "$ext" "$version"
+    publish_one "$ext" "$version"
+    released=$((released + 1))
+  done < <(each_extension)
+  echo "released ${released} extension(s)"
+}
+
+# Run unless sourced for tests (RELEASE_SH_LIB=1 exposes the functions only).
+if [ "${RELEASE_SH_LIB:-}" != "1" ]; then
+  case "${1:-}" in
+    plan) cmd_plan ;;
+    build) build_one "$2" "$3" ;;
+    publish) publish_one "$2" "$3" ;;
+    "") main ;;
+    *) echo "usage: $0 [plan | build <ext> <version> | publish <ext> <version>]" >&2; exit 2 ;;
+  esac
+fi

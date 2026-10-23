@@ -1,0 +1,23 @@
+name: ci
+
+on:
+  push:
+    branches: [dev, release]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ${{ vars.RUNNER || 'ubuntu-latest' }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Shellcheck
+        run: shellcheck bin/* tests/*.sh
+
+      - name: Smoke test
+        run: tests/smoke.sh

@@ -1,0 +1,110 @@
+#!/usr/bin/env bash
+# Build ONE extension into a server-ready (UNSIGNED) bundle.
+#
+# The extension is either the repository root (one extension per repository) or
+# a top-level <ext>/ directory of a repository that holds several, each with its
+# own extension.yaml (its own version). This script packs exactly one.
+#
+# The bundle is intentionally NOT signed here. The distribution server signs
+# checksums.txt with the key whose public half is embedded in aictl — keeping
+# that root-of-trust key off CI. See README.md ("Signing & trust").
+#
+# Usage: swaiz-ext-build [<extension-dir>]      e.g. swaiz-ext-build . | swaiz-ext-build archive
+# Output: $SWAIZ_EXT_DIST (default ./dist)
+set -euo pipefail
+
+ext="${1:-.}"
+ext="${ext%/}"
+[ -d "$ext" ] || { echo "no such directory: $ext" >&2; exit 2; }
+dir="$(cd "$ext" && pwd)"
+manifest="$dir/extension.yaml"
+[ -f "$manifest" ] || { echo "no extension.yaml in $ext/" >&2; exit 1; }
+dist="${SWAIZ_EXT_DIST:-$PWD/dist}"
+
+# Read a top-level scalar from the manifest, tolerant of inline "# comments" and
+# optional quotes (a copied .example keeps documentation comments on these lines).
+read_field() { sed -n "s/^$1:[[:space:]]*//p" "$2" | head -1 \
+  | sed -e 's/[[:space:]]*#.*$//' -e 's/^"\(.*\)"$/\1/' -e "s/^'\(.*\)'\$/\1/" -e 's/[[:space:]]*$//'; }
+
+name="$(read_field name "$manifest")"
+version="$(read_field version "$manifest")"
+[ -n "$name" ] && [ -n "$version" ] || { echo "could not read name/version from $manifest" >&2; exit 1; }
+
+# The directory name is the extension name — they must match (it is the download
+# path, the on-disk layout and the spec key).
+toplevel="$(git -C "$dir" rev-parse --show-toplevel 2>/dev/null || true)"
+if [ "$dir" != "$toplevel" ] && [ "$name" != "$(basename "$dir")" ]; then
+  echo "manifest name '$name' != directory '$(basename "$dir")' — keep them equal" >&2
+  exit 1
+fi
+
+# Enforce semver so the server's "latest = max(version)" is well-defined and
+# versions sort deterministically.
+echo "$version" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$' \
+  || { echo "version '$version' is not semver (MAJOR.MINOR.PATCH[-pre])" >&2; exit 1; }
+
+archive="${name}-${version}.tar.gz"
+outdir="$dist/dl/extensions/${name}/${version}"
+rm -rf "$dist/dl/extensions/${name}"
+mkdir -p "$outdir"
+
+# The bundle root must hold extension.yaml plus whichever contribution dirs the
+# extension actually has. The extension's own service image(s) (staged by
+# swaiz-ext-build-images into images/) ride INSIDE the bundle only while SMALL: aictl
+# caps the bundle download at 200 MB, so any image tarball over the threshold is
+# shipped as a SIBLING artifact next to the archive instead — listed in the same
+# (server-signed) checksums.txt and fetched+verified separately by aictl
+# (FetchServiceImage, up to 8 GB). Small images keep the kb-style single-download
+# install; a multi-GB model server (e.g. baked ASR weights) rides sibling.
+members=(extension.yaml)
+for d in migrations seeds n8n hooks images; do [ -d "$dir/$d" ] && members+=("$d"); done
+[ -d "$dir/hooks" ] && chmod +x "$dir"/hooks/*.sh 2>/dev/null || true
+
+inline_image_max=$((50 * 1024 * 1024))
+tar_excludes=()
+siblings=()
+if [ -d "$dir/images" ]; then
+  for f in "$dir"/images/*.image.tar.gz; do
+    [ -e "$f" ] || continue
+    if [ "$(stat -c%s "$f")" -gt "$inline_image_max" ]; then
+      siblings+=("$f")
+      tar_excludes+=(--exclude="images/$(basename "$f")")
+    fi
+  done
+fi
+tar -C "$dir" -czf "$outdir/$archive" ${tar_excludes[@]+"${tar_excludes[@]}"} "${members[@]}"
+
+aictl_max_bundle_bytes=$((200 * 1024 * 1024))
+aictl_max_extracted_bytes=$((2 * 1024 * 1024 * 1024))
+bundle_bytes="$(stat -c%s "$outdir/$archive")"
+extracted_bytes="$(gzip -dc "$outdir/$archive" | wc -c)"
+if [ "$bundle_bytes" -gt "$aictl_max_bundle_bytes" ] || [ "$extracted_bytes" -gt "$aictl_max_extracted_bytes" ]; then
+  echo "! $archive is $((bundle_bytes / 1024 / 1024)) MiB packed and $((extracted_bytes / 1024 / 1024)) MiB unpacked;" \
+    "aictl downloads at most $((aictl_max_bundle_bytes / 1024 / 1024)) MiB and unpacks at most" \
+    "$((aictl_max_extracted_bytes / 1024 / 1024)) MiB per bundle, so it could be released but not installed." >&2
+  echo "  Move large files out of the bundle, or lower inline_image_max so more images ship as sibling artifacts." >&2
+  rm -f "$outdir/$archive"
+  exit 1
+fi
+
+for f in ${siblings[@]+"${siblings[@]}"}; do
+  # Hardlink statt Kopie: die mehrgigabyte Tarballs liegen sonst doppelt auf
+  # der Platte (CI-Runner!). Fallback cp, falls dist/ auf anderem Filesystem.
+  ln -f "$f" "$outdir/$(basename "$f")" 2>/dev/null || cp "$f" "$outdir/"
+  echo "  sibling image artifact: $(basename "$f") ($(du -h "$f" | cut -f1))"
+done
+
+# checksums.txt in sha256sum format ("<hex>  <name>") covering the archive AND
+# any sibling image tarballs; aictl matches bare filenames, so generate it from
+# inside the version dir. The distribution server signs this one file, which is
+# what authenticates every artifact listed in it.
+( cd "$outdir" && shopt -s nullglob && sha256sum -- "$archive" *.image.tar.gz > checksums.txt )
+
+# latest.txt here is ONLY for local testing (python -m http.server). In
+# production the distribution server recomputes it as semver-max across all
+# published versions of this extension — never "last uploaded".
+echo "$version" > "$dist/dl/extensions/${name}/latest.txt"
+
+echo "built $outdir/$archive"
+echo "  sha256: $(head -1 "$outdir/checksums.txt" | cut -d' ' -f1)"
+echo "  (unsigned — the distribution server adds checksums.txt.sig on upload)"

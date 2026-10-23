@@ -1,0 +1,20 @@
+name: swaiz extension kit
+description: Puts the swaiz extension build and release tools on PATH, optionally with aictl.
+inputs:
+  install-aictl:
+    description: Also install aictl (for `aictl extension lint`).
+    required: false
+    default: "false"
+runs:
+  using: composite
+  steps:
+    - name: Put the kit on PATH
+      shell: bash
+      run: |
+        echo "$GITHUB_ACTION_PATH/bin" >> "$GITHUB_PATH"
+        echo "SWAIZ_EXTENSION_KIT=$GITHUB_ACTION_PATH" >> "$GITHUB_ENV"
+
+    - name: Install aictl
+      if: inputs.install-aictl == 'true'
+      shell: bash
+      run: curl -fsSL https://swaiz.ch/install | sh

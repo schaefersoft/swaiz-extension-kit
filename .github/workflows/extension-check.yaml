@@ -27,6 +27,7 @@ jobs:
           if [ -f extension.yaml ]; then
             out='{"ext":"."}'
           else
+            # New branch / force push / missing base: check every extension.
             if [ -z "$BASE" ] || ! git cat-file -e "$BASE" 2>/dev/null; then
               changed=$(ls -d */ | sed 's#/##')
             else
@@ -48,7 +49,7 @@ jobs:
     if: needs.changes.outputs.any == 'true'
     runs-on: ${{ inputs.runner || vars.RUNNER || 'ubuntu-latest' }}
     strategy:
-      fail-fast: false
+      fail-fast: false # every extension reports its own status
       matrix:
         include: ${{ fromJson(needs.changes.outputs.matrix) }}
     name: check ${{ matrix.ext != '.' && matrix.ext || '' }}

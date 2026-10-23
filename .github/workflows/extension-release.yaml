@@ -21,8 +21,10 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          # The branch tip, not the SHA that triggered the run: a queued run
+          # would otherwise plan and build a state the run before it moved on from.
           ref: ${{ github.ref_name }}
-          fetch-depth: 0
+          fetch-depth: 0 # full tag history decides what is already released
 
       - uses: schaefersoft/swaiz-extension-kit@v1
 
@@ -52,7 +54,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.ref_name }}
-          fetch-depth: 0
+          fetch-depth: 0 # tags for the idempotent already-published skip
 
       - name: Free runner disk space
         run: |

@@ -1,7 +1,7 @@
 # swaiz-extension-kit
 
 Build and release tooling for **swaiz extensions** — the add-ons that
-[`aictl`](https://github.com/schaefersoft/swaiz-cli) installs on top of the swaiz
+`aictl` installs on top of the swaiz
 platform. The kit turns an extension's source into a server-ready bundle and
 publishes it as a GitHub Release, which the distribution server then pulls,
 signs and serves to `aictl extension install`.

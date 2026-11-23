@@ -30,12 +30,49 @@ name="$(read_field name "$manifest")"
 version="$(read_field version "$manifest")"
 if [ -z "$name" ] || [ -z "$version" ]; then echo "could not read name/version from $manifest" >&2; exit 1; fi
 
+gpu_image_tag() {
+  local repo="$1" line
+  line="$(grep -E "^[[:space:]]*gpuImage:[[:space:]]*[\"']?${repo}:" "$manifest" | head -1 || true)"
+  if [ -z "$line" ]; then
+    if grep -Eq "gpuImage:[[:space:]]*[\"']?${repo}:" "$manifest"; then
+      echo "! the gpuImage of ${repo} has to stand on its own line (block style) in $manifest" >&2
+      return 1
+    fi
+    return 0
+  fi
+  printf '%s\n' "$line" | sed -E -e 's/[[:space:]]+#.*$//' -e "s/^[[:space:]]*gpuImage:[[:space:]]*[\"']?${repo}://" -e "s/[\"'[:space:]]*\$//"
+}
+
 # Staging dir inside the extension; swaiz-ext-build adds it as a bundle member so the
 # image ships inside the download zip. Rebuilt fresh each run.
 imgdir="$dir/images"
 rm -rf "$imgdir"; mkdir -p "$imgdir"
 
 built=0
+
+build_variant() {
+  local ref="$1" out="$2" variant_args=()
+  shift 2
+  [ "$#" -gt 0 ] && variant_args=("$@")
+  echo "+ building $ref"
+  # The extension version is NOT baked in: aictl injects AICTL_EXTENSION_VERSION
+  # into every service at install time, so the same image reports whatever
+  # version it was shipped as.
+  # Single-arch amd64: on-prem services nodes are amd64; a tarball is one arch.
+  docker build --platform linux/amd64 ${secret_args[@]+"${secret_args[@]}"} ${variant_args[@]+"${variant_args[@]}"} --build-context notices="$kit/notices" -t "$ref" "$svcdir"
+  docker save "$ref" | gzip > "$imgdir/$out"
+  echo "  saved $imgdir/$out ($(du -h "$imgdir/$out" | cut -f1))"
+  # In CI den Platz sofort zurückgeben: das Image steckt jetzt im Tarball, und
+  # der nächste grosse Build/Save braucht den Headroom (ein Modell-Server-Image
+  # belegt sonst Cache + Image + Export-Tmp gleichzeitig). Lokal bleibt das
+  # Image erhalten (Demo-Stacks nutzen es direkt).
+  if [ -n "${CI:-}" ]; then
+    docker rmi "$ref" >/dev/null 2>&1 || true
+    docker builder prune -af >/dev/null 2>&1 || true
+  fi
+  built=$((built + 1))
+}
+
 for svcdir in "$dir"/services/*/; do
   [ -f "$svcdir/Dockerfile" ] || continue
   svc="$(basename "$svcdir")"
@@ -44,7 +81,16 @@ for svcdir in "$dir"/services/*/; do
   tag="${name}-${svc}:${version}"
   tarball="${name}-${svc}-${version}.image.tar.gz"
 
-  echo "+ building $tag"
+  gpu_tag="$(gpu_image_tag "${name}-${svc}")"
+  if [ -n "$gpu_tag" ]; then
+    case "$gpu_tag" in
+      *"\${version}"*) ;;
+      *) echo "! gpuImage ${name}-${svc}:${gpu_tag} has to carry \${version} in its tag (e.g. ${name}-${svc}:\${version}-gpu)" >&2; exit 1 ;;
+    esac
+    gpu_tag="${name}-${svc}:${gpu_tag//\$\{version\}/$version}"
+    [ "$gpu_tag" != "$tag" ] || { echo "! gpuImage of ${svc} is the same reference as its image" >&2; exit 1; }
+  fi
+
   # A gated HuggingFace download (e.g. pyannote weights baked in at build time)
   # takes the token as a BuildKit SECRET — never a build-arg/env, so it cannot
   # end up in an image layer. Dockerfiles opt in via
@@ -52,22 +98,11 @@ for svcdir in "$dir"/services/*/; do
   # env nothing is passed and ungated builds are unaffected.
   secret_args=()
   [ -n "${HF_TOKEN:-}" ] && secret_args+=(--secret "id=hf_token,env=HF_TOKEN")
-  # The extension version is NOT baked in: aictl injects AICTL_EXTENSION_VERSION
-  # into every service at install time, so the same image reports whatever
-  # version it was shipped as.
-  # Single-arch amd64: on-prem services nodes are amd64; a tarball is one arch.
-  docker build --platform linux/amd64 "${secret_args[@]}" --build-context notices="$kit/notices" -t "$tag" "$svcdir"
-  docker save "$tag" | gzip > "$imgdir/$tarball"
-  echo "  saved $imgdir/$tarball ($(du -h "$imgdir/$tarball" | cut -f1))"
-  # In CI den Platz sofort zurückgeben: das Image steckt jetzt im Tarball, und
-  # der nächste grosse Build/Save braucht den Headroom (ein Modell-Server-Image
-  # belegt sonst Cache + Image + Export-Tmp gleichzeitig). Lokal bleibt das
-  # Image erhalten (Demo-Stacks nutzen es direkt).
-  if [ -n "${CI:-}" ]; then
-    docker rmi "$tag" >/dev/null 2>&1 || true
-    docker builder prune -af >/dev/null 2>&1 || true
+
+  build_variant "$tag" "$tarball"
+  if [ -n "$gpu_tag" ]; then
+    build_variant "$gpu_tag" "${name}-${svc}-${version}.gpu.image.tar.gz" --build-arg VARIANT=gpu
   fi
-  built=$((built + 1))
 done
 
 # All services are third-party registry refs (no Dockerfile) → no images/ dir.

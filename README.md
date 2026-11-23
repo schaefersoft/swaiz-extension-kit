@@ -168,6 +168,28 @@ since aictl could not install it. GitHub rejects release assets over 2 GiB;
 Third-party images (no Dockerfile in the repository) are referenced from their
 public registry, pinned by digest, and pulled at install.
 
+### GPU builds
+
+A service may name a second build for hosts whose docker can hand out an
+NVIDIA GPU:
+
+```yaml
+  asr:
+    image: <name>-asr:${version}
+    gpuImage: <name>-asr:${version}-gpu
+    resources: { gpu: optional }
+```
+
+When `gpuImage` names the service's own repository, `swaiz-ext-build-images`
+builds the same Dockerfile a second time with `--build-arg VARIANT=gpu` and
+saves it as `images/<name>-<svc>-<version>.gpu.image.tar.gz`; the CPU build
+gets no build argument. The Dockerfile decides what the variant changes
+(`ARG VARIANT=cpu`). aictl downloads only the build the host runs. Keep
+`gpuImage` on its own line and give its tag `${version}`, or the build stops.
+A `gpuImage` from another repository is not built but pulled at install. The
+GPU build is a release asset like any other, so it has to stay under 2 GiB as
+well.
+
 Every own image carries its open-source notices under `/licenses/`. The
 generators in `notices/` reach the Dockerfiles as an extra build context named
 `notices`; a manual `docker build` needs
@@ -217,6 +239,7 @@ test installation, see
 | `version '…' is not semver` | `version:` is not `MAJOR.MINOR.PATCH[-pre]`. | Fix the manifest. |
 | `manifest name '…' != directory '…'` | Several extensions per repository: directory and `name:` differ. | Rename one of them. |
 | `… überschreitet GitHubs 2-GiB-Asset-Limit` | A sibling image is over GitHub's 2 GiB limit for release assets. Nothing was tagged. | Slim the image: drop build tools, and download model weights on first start into a volume instead of baking them in. |
+| `! gpuImage … has to carry ${version} in its tag` / `has to stand on its own line` | The manifest's `gpuImage` for an own image is pinned to one version or written in flow style. | Write it on its own line as `gpuImage: <name>-<svc>:${version}-gpu`. |
 | `<name>-<version>.tar.gz is … MiB packed and … MiB unpacked` | The bundle exceeds what aictl downloads (200 MiB) or unpacks (2 GiB). | Move large files out of the bundle. Images over 50 MB already ship as siblings. |
 | `referenced file(s) missing` from `aictl extension lint` | A hook, n8n workflow, migration or seed named in the manifest is not in the repository. | Add the file or fix the path. |
 | `check.sh` fails in the release job | The release refuses to ship an unhealthy extension. Nothing was tagged. | Fix it on `dev` and merge again. |

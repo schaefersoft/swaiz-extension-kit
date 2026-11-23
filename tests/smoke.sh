@@ -99,6 +99,77 @@ fi
 
 if swaiz-ext-build-images alpha >/dev/null; then pass "no services/ means no images"; else fail "build-images without services/"; fi
 
+echo "== own images with a GPU build"
+stub="$work/stub"
+mkdir -p "$stub"
+cat > "$stub/docker" <<'STUB'
+#!/usr/bin/env bash
+echo "$*" >> "$DOCKER_LOG"
+if [ "$1" = save ]; then printf 'image %s' "$2"; fi
+STUB
+chmod +x "$stub/docker"
+export DOCKER_LOG="$work/docker.log"
+
+gpu="$work/swaiz-gpu"
+mkdir -p "$gpu/services/asr" "$gpu/services/api"
+cd "$gpu"
+git init -q -b release
+git config core.autocrlf false
+gpu_manifest() {
+  cat > extension.yaml <<YAML
+apiVersion: aictl.io/v2
+kind: Extension
+name: demo
+version: 0.4.0
+services:
+  asr:
+$1
+    resources: { gpu: optional }
+  api:
+    image: demo-api:\${version}
+YAML
+}
+gpu_manifest "    image: demo-asr:\${version}
+    gpuImage: demo-asr:\${version}-gpu   # CUDA build"
+echo "FROM scratch" > services/asr/Dockerfile
+echo "FROM scratch" > services/api/Dockerfile
+commit "feat: images"
+
+: > "$DOCKER_LOG"
+if PATH="$stub:$PATH" swaiz-ext-build-images . >/dev/null; then pass "images with a GPU build are built"; else fail "build-images with a gpuImage"; fi
+expect "the GPU build is tagged as the manifest names it" "$(grep -c -e '-t demo-asr:0.4.0-gpu ' "$DOCKER_LOG")" "1"
+expect "only the GPU build is built with VARIANT=gpu" "$(grep -e '--build-arg VARIANT=gpu' "$DOCKER_LOG" | grep -c -e '-t demo-asr:0.4.0-gpu ')" "1"
+expect "the CPU builds get no variant" "$(grep -c -e '--build-arg' "$DOCKER_LOG")" "1"
+expect "one tarball per build" "$(find images -type f -printf '%f\n' | LC_ALL=C sort | tr '\n' ' ')" "demo-api-0.4.0.image.tar.gz demo-asr-0.4.0.gpu.image.tar.gz demo-asr-0.4.0.image.tar.gz "
+
+PATH="$stub:$PATH" swaiz-ext-build . >/dev/null
+expect "the bundle carries the GPU build next to the CPU one" \
+  "$(tar -tzf dist/dl/extensions/demo/0.4.0/demo-0.4.0.tar.gz | grep '^images/' | LC_ALL=C sort | tr '\n' ' ')" \
+  "images/ images/demo-api-0.4.0.image.tar.gz images/demo-asr-0.4.0.gpu.image.tar.gz images/demo-asr-0.4.0.image.tar.gz "
+rm -rf dist images
+
+gpu_manifest "    image: demo-asr:\${version}
+    gpuImage: demo-asr:0.4.0-gpu"
+if PATH="$stub:$PATH" swaiz-ext-build-images . >/dev/null 2>&1; then
+  fail "a gpuImage without \${version} must be rejected"
+else
+  pass "a gpuImage without \${version} is rejected"
+fi
+
+gpu_manifest "    { image: demo-asr:\${version}, gpuImage: demo-asr:\${version}-gpu }"
+if PATH="$stub:$PATH" swaiz-ext-build-images . >/dev/null 2>&1; then
+  fail "a gpuImage in flow style must be rejected rather than silently not built"
+else
+  pass "a gpuImage in flow style is rejected"
+fi
+
+gpu_manifest "    image: demo-asr:\${version}
+    gpuImage: quay.io/vendor/asr-cuda:1.0"
+: > "$DOCKER_LOG"
+PATH="$stub:$PATH" swaiz-ext-build-images . >/dev/null
+expect "a third-party gpuImage is pulled at install, not built" "$(grep -c -e '--build-arg' "$DOCKER_LOG")" "0"
+rm -rf images
+
 echo
 if [ "$failures" -gt 0 ]; then
   echo "$failures check(s) failed" >&2
